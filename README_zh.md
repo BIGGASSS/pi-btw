@@ -36,6 +36,25 @@ Claude Code 风格的 `/btw` side question 扩展，为 [pi](https://pi.dev) 打
 
 历史 side Q&A 以暗色问题列表显示在当前答案上方，只存在内存里，`/new`、重启即清空，也永远不会进入主会话。
 
+## 配置
+
+默认情况下，side agent 使用主会话的模型和 thinking level。要固定使用别的模型，创建 `~/.pi/agent/btw.json`：
+
+```json
+{
+	"model": "openai/gpt-5.2",
+	"thinking": "low"
+}
+```
+
+- `model` — `provider/modelId`；裸 model id 在跨 provider 无歧义时也可以
+- `thinking` — 可选：`off` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max`；省略时跟随主会话的 thinking level
+- 每次提问前都会重新读取该文件，改完即时生效，无需重启
+- 配置非法时会直接报错并放弃本次提问，绝不静默回退
+- 删除文件（或清空 `model` 字段）即恢复跟随主会话
+
+overlay 标题会显示 side agent 当前使用的模型。
+
 ## 安装
 
 ```bash
@@ -58,7 +77,7 @@ pi -e /path/to/pi-btw
 
 - 每次 pi 会话懒创建一个 in-memory `AgentSession` 子会话（`SessionManager.inMemory()`，不落盘）；主会话 messages（`buildSessionContext` + `convertToLlm`）先写入子会话 journal 再创建，由 `createAgentSession` 的官方恢复路径装载，compaction 重建后也不会丢
 - 子会话工具白名单 `["read", "grep", "find", "ls"]`，无 bash / edit / write
-- 模型与 thinking level 继承主会话，每次提问前同步
+- 模型与 thinking level 默认跟随主会话；通过 `~/.pi/agent/btw.json` 固定后不再回同步主会话模型，且子会话使用内存版 settings，模型切换不会写用户的全局 pi settings
 - system prompt 由子会话重新组装：取主会话原始 `customPrompt` 与 `appendSystemPrompt`（经 `getSystemPromptOptions()`）叠加 btw 角色提示；AGENTS.md / skills 首次 `/btw` 时从磁盘加载，工具段正确列出 4 个只读工具
 - system prompt 明确声明：只读的临时 side agent，主 agent 未被打断，只回答，不承诺任何修改
 

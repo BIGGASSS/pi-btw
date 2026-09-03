@@ -1,4 +1,7 @@
-import { contentText } from "@earendil-works/pi-ai";
+import * as fs from "node:fs";
+import { join } from "node:path";
+
+import { contentText, type Model } from "@earendil-works/pi-ai";
 import {
 	buildSessionContext,
 	convertToLlm,
@@ -8,6 +11,7 @@ import {
 	getAgentDir,
 	getMarkdownTheme,
 	SessionManager,
+	SettingsManager,
 	type AgentSession,
 	type AgentSessionEvent,
 	type ExtensionAPI,
@@ -47,6 +51,78 @@ const BTW_SYSTEM_PROMPT = [
 ].join(" ");
 
 const MAX_HISTORY_EXCHANGES = 20;
+
+const BTW_CONFIG_FILENAME = "btw.json";
+const BTW_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+type BtwThinkingLevel = (typeof BTW_THINKING_LEVELS)[number];
+
+interface BtwConfigFile {
+	model?: unknown;
+	thinking?: unknown;
+}
+
+/** Model pinned for the side agent via ~/.pi/agent/btw.json. */
+type BtwModelResolution =
+	| { configured: false }
+	| { configured: true; model: Model<any>; thinking?: BtwThinkingLevel };
+
+/**
+ * Read the side-agent model config from ~/.pi/agent/btw.json.
+ * A missing file or empty `model` means "follow the main session". Anything that
+ * looks like a broken config throws so it gets reported, never silently ignored.
+ */
+function readBtwModelResolution(ctx: ExtensionCommandContext): BtwModelResolution {
+	const configPath = join(getAgentDir(), BTW_CONFIG_FILENAME);
+	let raw: string;
+	try {
+		raw = fs.readFileSync(configPath, "utf8");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return { configured: false };
+		throw new Error(`btw: cannot read ${configPath}: ${errorMessage(error)}`);
+	}
+	let config: BtwConfigFile;
+	try {
+		config = JSON.parse(raw) as BtwConfigFile;
+	} catch (error) {
+		throw new Error(`btw: invalid JSON in ${configPath}: ${errorMessage(error)}`);
+	}
+	if (typeof config !== "object" || config === null) {
+		throw new Error(`btw: ${configPath} must contain a JSON object`);
+	}
+	if (typeof config.model !== "string" || config.model.length === 0) return { configured: false };
+	let thinking: BtwThinkingLevel | undefined;
+	if (config.thinking !== undefined) {
+		if (
+			typeof config.thinking !== "string" ||
+			!BTW_THINKING_LEVELS.includes(config.thinking as BtwThinkingLevel)
+		) {
+			throw new Error(`btw: invalid "thinking" in ${configPath}: expected one of ${BTW_THINKING_LEVELS.join(", ")}`);
+		}
+		thinking = config.thinking as BtwThinkingLevel;
+	}
+	const registry = ctx.modelRegistry;
+	const reference = config.model;
+	let model: Model<any> | undefined;
+	if (reference.includes("/")) {
+		const slash = reference.indexOf("/");
+		model = registry.find(reference.slice(0, slash), reference.slice(slash + 1));
+	} else {
+		const matches = registry.getAll().filter((candidate) => candidate.id === reference);
+		if (matches.length > 1) {
+			throw new Error(`btw: ambiguous model id "${reference}" in ${configPath}, use provider/modelId`);
+		}
+		model = matches[0];
+	}
+	if (!model) throw new Error(`btw: unknown model "${reference}" in ${configPath}`);
+	if (!registry.hasConfiguredAuth(model)) {
+		throw new Error(`btw: no API key for ${model.provider}/${model.id}`);
+	}
+	return { configured: true, model, thinking };
+}
+
+function errorMessage(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
 
 interface BtwExchange {
 	question: string;
@@ -129,6 +205,11 @@ export default function btw(pi: ExtensionAPI) {
 		}
 	}
 
+	function modelLabel(): string {
+		const model = subSession?.model;
+		return model ? `${model.provider}/${model.id}` : "";
+	}
+
 	function currentSelection(): BtwSelection | null {
 		if (active) return { question: active.question, answer: active.answer, label: "answering…" };
 		const exchange = exchanges[viewIndex];
@@ -149,10 +230,14 @@ export default function btw(pi: ExtensionAPI) {
 		}
 	}
 
-	async function ensureBtwSession(ctx: ExtensionCommandContext): Promise<AgentSession | null> {
+	async function ensureBtwSession(
+		ctx: ExtensionCommandContext,
+		resolution: BtwModelResolution,
+	): Promise<AgentSession | null> {
 		if (subSession) return subSession;
-		if (!ctx.model) {
-			notify(ctx, "No active model for /btw", "error");
+		const model = resolution.configured ? resolution.model : ctx.model;
+		if (!model) {
+			notify(ctx, "No active model for /btw (pin one via ~/.pi/agent/btw.json)", "error");
 			return null;
 		}
 		const resourceLoader = createBtwResourceLoader(ctx);
@@ -168,11 +253,14 @@ export default function btw(pi: ExtensionAPI) {
 		);
 		for (const message of seed) sessionManager.appendMessage(message);
 		const { session } = await createAgentSession({
-			model: ctx.model,
-			thinkingLevel: pi.getThinkingLevel(),
+			model,
+			thinkingLevel: resolution.configured ? (resolution.thinking ?? pi.getThinkingLevel()) : pi.getThinkingLevel(),
 			tools: ["read", "grep", "find", "ls"],
 			sessionManager,
 			resourceLoader,
+			// In-memory settings: the sub-session's setModel/setThinkingLevel used to leak
+			// into the user's global settings.json through the file-backed default.
+			settingsManager: SettingsManager.inMemory(),
 		});
 		subSession = session;
 		return session;
@@ -206,7 +294,15 @@ export default function btw(pi: ExtensionAPI) {
 			setStatus("Still answering — press Esc to abort first.");
 			return;
 		}
-		const session = await ensureBtwSession(ctx);
+		// Re-read on every ask so edits to btw.json apply without a restart.
+		let resolution: BtwModelResolution;
+		try {
+			resolution = readBtwModelResolution(ctx);
+		} catch (error) {
+			notify(ctx, errorMessage(error), "error");
+			return;
+		}
+		const session = await ensureBtwSession(ctx, resolution);
 		if (!session) return;
 
 		if (!subscribed) {
@@ -214,10 +310,15 @@ export default function btw(pi: ExtensionAPI) {
 			subscribed = true;
 		}
 
-		// Follow the main session's current model and thinking level.
+		// A pinned model is never re-synced to the main session's; unpinned follows it.
 		try {
-			if (ctx.model) await session.setModel(ctx.model);
-			session.setThinkingLevel(pi.getThinkingLevel());
+			const target = resolution.configured ? resolution.model : ctx.model;
+			if (target && (session.model?.provider !== target.provider || session.model?.id !== target.id)) {
+				await session.setModel(target);
+			}
+			session.setThinkingLevel(
+				resolution.configured && resolution.thinking ? resolution.thinking : pi.getThinkingLevel(),
+			);
 		} catch {
 			// Keep whatever the sub-session already uses.
 		}
@@ -307,6 +408,7 @@ export default function btw(pi: ExtensionAPI) {
 						readActive: () => active,
 						readViewIndex: () => viewIndex,
 						readCurrent: () => currentSelection(),
+						readModelLabel: () => modelLabel(),
 						setViewIndex: (index) => {
 							viewIndex = index;
 						},
@@ -402,6 +504,7 @@ interface BtwOverlayCallbacks {
 	readActive: () => BtwActive | null;
 	readViewIndex: () => number;
 	readCurrent: () => BtwSelection | null;
+	readModelLabel: () => string;
 	setViewIndex: (index: number) => void;
 	onSubmit: (value: string) => void;
 	onDismiss: () => void;
@@ -578,12 +681,16 @@ class BtwOverlayComponent implements Component, Focusable {
 		const statusText =
 			this.status ||
 			(active ? `streaming…${active.toolName ? ` · ${active.toolName}` : ""}` : view ? view.label : "ready");
+		const modelText = (() => {
+			const label = this.callbacks.readModelLabel();
+			return label ? ` · ${label}` : "";
+		})();
 		const viewLabel = active ? "" : ` · ${exchanges.length} in memory`;
 		const scrollHint = hiddenAbove ? ` · ↑${hiddenAbove} above · ↑↓ scroll` : "";
 
 		const lines: string[] = [
 			this.borderLine(innerWidth, "top"),
-			this.frameLine(dim("accent", `btw · side question${viewLabel}`), innerWidth),
+			this.frameLine(dim("accent", `btw · side question${modelText}${viewLabel}`), innerWidth),
 			this.ruleLine(innerWidth),
 			...visible.map((line) => this.frameLine(line, innerWidth)),
 			this.ruleLine(innerWidth),

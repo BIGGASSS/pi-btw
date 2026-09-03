@@ -75,6 +75,30 @@ Earlier questions appear as a dimmed list above the current answer. The side
 thread lives in memory only — `/new`, restarts and reloads clear it, and none
 of it ever reaches the main conversation.
 
+## Configuration
+
+By default the side agent uses the main session's model and thinking level.
+To pin a different model, create `~/.pi/agent/btw.json`:
+
+```json
+{
+	"model": "openai/gpt-5.2",
+	"thinking": "low"
+}
+```
+
+- `model` — `provider/modelId`, or a bare model id when it is unambiguous
+  across providers
+- `thinking` — optional: `off` / `minimal` / `low` / `medium` / `high` /
+  `xhigh` / `max`; when omitted, the main session's thinking level is used
+- the file is re-read before every ask, so edits apply without a restart
+- an invalid config is reported and the question is dropped — it never
+  silently falls back
+- delete the file (or empty the `model` field) to follow the main session
+  again
+
+The overlay title shows the model the side agent is currently using.
+
 ## Design
 
 - one lazily-created in-memory `AgentSession` sub-session per pi session
@@ -83,7 +107,10 @@ of it ever reaches the main conversation.
   sub-session journal before creation — `createAgentSession` restores them
   through its own path, so they also survive compaction rebuilds
 - tool whitelist `["read", "grep", "find", "ls"]` — no bash, no edit, no write
-- model and thinking level inherit the main session and re-sync before every ask
+- model and thinking level follow the main session unless pinned via
+  `~/.pi/agent/btw.json`; a pinned model is never re-synced to the main
+  session's, and the sub-session runs on in-memory settings so its model
+  switches never touch the user's global pi settings
 - the system prompt is composed fresh by the sub-session from the main
   session's raw `customPrompt` and `appendSystemPrompt` (via
   `getSystemPromptOptions()`) plus the btw role prompt; context files and

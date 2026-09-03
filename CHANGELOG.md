@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-09-03
+
+### Added
+
+- Side-agent model can be pinned via `~/.pi/agent/btw.json`
+  (`{"model": "provider/modelId", "thinking": "low"}`); a pinned model is
+  never re-synced to the main session's. The file is re-read before every
+  ask, invalid configs are reported instead of silently falling back, and
+  the overlay title shows the model currently in use.
+
+### Fixed
+
+- The sub-session now runs on in-memory settings: its model/thinking
+  switches no longer leak into the user's global `settings.json`.
+
 ## [0.1.1] - 2026-08-18
 
 ### Fixed
