@@ -21,16 +21,20 @@
 			"./extensions/btw.ts"
 		]
 	},
+	"scripts": {
+		"typecheck": "tsc --noEmit",
+		"test": "node --experimental-test-module-mocks --test tests/*.test.ts"
+	},
 	"devDependencies": {
-		"@earendil-works/pi-ai": "^0.84.1",
-		"@earendil-works/pi-coding-agent": "^0.84.1",
-		"@earendil-works/pi-tui": "^0.84.1",
+		"@earendil-works/pi-ai": "^1.4.0",
+		"@earendil-works/pi-coding-agent": "^1.4.0",
+		"@earendil-works/pi-tui": "^1.4.0",
 		"typescript": "^7.0.2"
 	},
 	"peerDependencies": {
-		"@earendil-works/pi-ai": "^0.84.1",
-		"@earendil-works/pi-coding-agent": "^0.84.1",
-		"@earendil-works/pi-tui": "^0.84.1"
+		"@earendil-works/pi-ai": "*",
+		"@earendil-works/pi-coding-agent": "*",
+		"@earendil-works/pi-tui": "*"
 	},
 	"repository": {
 		"type": "git",

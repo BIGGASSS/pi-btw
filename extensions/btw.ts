@@ -32,14 +32,16 @@ import {
 	visibleWidth,
 } from "@earendil-works/pi-tui";
 
+import { createBtwUsageRecorder } from "./lib/usage.ts";
+
 /**
  * pi-btw-cc — Claude Code-style /btw side questions.
  *
  * `/btw <question>` asks a side question in a floating top-center overlay
  * while the main agent keeps running. The side agent is a real in-memory
  * pi sub-session seeded with the main session's messages, restricted to
- * read-only tools (read/grep/find/ls). Nothing is ever written back to the
- * main conversation; the side thread lives only in this extension instance.
+ * read-only tools (read/grep/find/ls). Only usage accounting is written back
+ * to the main session; the side conversation lives only in this instance.
  */
 
 const BTW_SYSTEM_PROMPT = [
@@ -187,7 +189,10 @@ export default function btw(pi: ExtensionAPI) {
 	let viewIndex = 0;
 	let overlayRuntime: OverlayRuntime | null = null;
 	let subSession: AgentSession | null = null;
-	let subscribed = false;
+	let recordUsage: (() => boolean) | null = null;
+	let usageContext: ExtensionCommandContext | null = null;
+	let pendingAsk: Promise<void> | null = null;
+	let shuttingDown = false;
 
 	function setStatus(status: string): void {
 		if (overlayRuntime?.setStatus) overlayRuntime.setStatus(status);
@@ -262,11 +267,44 @@ export default function btw(pi: ExtensionAPI) {
 			// into the user's global settings.json through the file-backed default.
 			settingsManager: SettingsManager.inMemory(),
 		});
+		try {
+			recordUsage = createBtwUsageRecorder(ctx.sessionManager, sessionManager, () => session.model ?? model);
+		} catch (error) {
+			session.dispose();
+			throw error;
+		}
+		usageContext = ctx;
+		session.subscribe(handleSessionEvent);
 		subSession = session;
 		return session;
 	}
 
+	function flushUsage(): void {
+		try {
+			if (recordUsage?.()) refreshOverlay();
+		} catch (error) {
+			if (usageContext) notify(usageContext, `Failed to record /btw usage: ${errorMessage(error)}`, "error");
+		}
+	}
+
 	function handleSessionEvent(event: AgentSessionEvent): void {
+		// abort() can return while prompt() is still awaiting authentication, before
+		// pi considers it busy. Cancel again when that late run/compaction starts,
+		// synchronously before it can send a provider request.
+		if (shuttingDown && (event.type === "agent_start" || event.type === "compaction_start")) {
+			void abortActive();
+		}
+		// These boundaries occur after journal writes. message_end listeners run
+		// before persistence, so reading the journal there would miss that message.
+		if (
+			event.type === "turn_end" ||
+			event.type === "tool_execution_start" ||
+			event.type === "compaction_end" ||
+			event.type === "agent_end" ||
+			event.type === "entry_appended"
+		) {
+			flushUsage();
+		}
 		if (!active) return;
 		if (event.type === "message_update" && event.message.role === "assistant") {
 			active.answer = contentText(event.message.content).trim();
@@ -289,26 +327,32 @@ export default function btw(pi: ExtensionAPI) {
 		refreshOverlay();
 	}
 
-	async function ask(ctx: ExtensionCommandContext, question: string): Promise<void> {
-		if (active) {
+	function ask(ctx: ExtensionCommandContext, question: string): Promise<void> {
+		if (shuttingDown) return Promise.resolve();
+		if (pendingAsk) {
 			setStatus("Still answering — press Esc to abort first.");
-			return;
+			return Promise.resolve();
 		}
+		// Reserve the ask before asynchronous session creation so overlapping
+		// submissions cannot create two children or duplicate usage recorders.
+		pendingAsk = runAsk(ctx, question).finally(() => {
+			pendingAsk = null;
+		});
+		return pendingAsk;
+	}
+
+	async function runAsk(ctx: ExtensionCommandContext, question: string): Promise<void> {
 		// Re-read on every ask so edits to btw.json apply without a restart.
 		let resolution: BtwModelResolution;
+		let session: AgentSession | null;
 		try {
 			resolution = readBtwModelResolution(ctx);
+			session = await ensureBtwSession(ctx, resolution);
 		} catch (error) {
 			notify(ctx, errorMessage(error), "error");
 			return;
 		}
-		const session = await ensureBtwSession(ctx, resolution);
-		if (!session) return;
-
-		if (!subscribed) {
-			session.subscribe(handleSessionEvent);
-			subscribed = true;
-		}
+		if (!session || shuttingDown) return;
 
 		// A pinned model is never re-synced to the main session's; unpinned follows it.
 		try {
@@ -323,6 +367,7 @@ export default function btw(pi: ExtensionAPI) {
 			// Keep whatever the sub-session already uses.
 		}
 
+		if (shuttingDown) return;
 		active = { question, answer: "", toolName: null };
 		refreshOverlay();
 		setStatus("streaming…");
@@ -335,6 +380,9 @@ export default function btw(pi: ExtensionAPI) {
 				"error",
 			);
 			return;
+		} finally {
+			// Also drain on aborts and thrown prompts, even if no final event fired.
+			flushUsage();
 		}
 
 		const response = [...session.messages].reverse().find((message) => message.role === "assistant");
@@ -460,6 +508,18 @@ export default function btw(pi: ExtensionAPI) {
 				notify(ctx, error instanceof Error ? error.message : String(error), "error");
 			});
 	}
+
+	pi.on("session_shutdown", async () => {
+		shuttingDown = true;
+		await abortActive();
+		await pendingAsk;
+		flushUsage();
+		subSession?.dispose();
+		subSession = null;
+		recordUsage = null;
+		usageContext = null;
+		closeOverlay();
+	});
 
 	// Toggle focus between the overlay and the main editor while the overlay stays visible.
 	for (const shortcut of ["alt+/", "ctrl+alt+w"]) {

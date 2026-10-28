@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Side-agent token usage and costs are recorded as native `usage` entries in
+  the main session, included in its footer and `/session` totals, and retained
+  when saved sessions resume. Side questions, answers, and tool output remain
+  private to the in-memory side thread.
+- Accounting covers all new side-agent turns and compaction, including reported
+  error/abort usage, without recounting seeded history or earlier questions.
+- Offline tests verify accounting, persistence, native totals, and lifecycle
+  handling; CI now runs tests alongside typechecking.
+
+### Changed
+
+- Requires pi 1.4.0 or newer for native accounting-only entries.
+- Shutdown aborts and drains the side session before disposal; overlapping
+  submissions during initialization no longer create duplicate side sessions.
+
 ## [0.2.0] - 2026-09-03
 
 ### Added
